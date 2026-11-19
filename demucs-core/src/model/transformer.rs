@@ -1,7 +1,7 @@
 use burn::{
     module::Module,
     nn::{
-        attention::{MhaInput, MultiHeadAttention, MultiHeadAttentionConfig},
+        attention::{MultiHeadAttention, MultiHeadAttentionConfig},
         conv::{Conv1d, Conv1dConfig},
         GroupNorm, GroupNormConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig,
     },
@@ -11,6 +11,50 @@ use burn::{
 };
 
 use crate::model::conv::LayerScale;
+
+/// L'attention à plusieurs têtes, avec les poids de `mha`, têtes complétées
+/// par des zéros jusqu'au multiple de 32 supérieur.
+///
+/// Mathématiquement identique à `MultiHeadAttention::forward` (les zéros
+/// n'ajoutent rien aux produits scalaires ni au contexte, retiré ensuite),
+/// mais contourne un noyau de produit matriciel faux de cubecl en MSL
+/// (`burn/metal`) : avec des têtes de 48 (htdemucs_6s, d_model 384 sur
+/// 8 têtes) et 1 280 à 1 536 positions, `Q·Kᵀ` s'écarte jusqu'à 70 % du
+/// maximum. À 32 ou 64, le noyau est juste. Reproducteur :
+/// `rusty_music/crates/editor/examples/formes_attention.rs`.
+pub(crate) fn attention<B: Backend>(
+    mha: &MultiHeadAttention<B>,
+    requete: Tensor<B, 3>,
+    source: Tensor<B, 3>,
+) -> Tensor<B, 3> {
+    let [b, sq, d] = requete.dims();
+    let [_, sk, _] = source.dims();
+    let h = T_HEADS;
+    let dk = d / h;
+    let dp = dk.next_multiple_of(32);
+    let device = requete.device();
+    let tetes = |x: Tensor<B, 3>, l: &Linear<B>, s: usize| {
+        let t = l.forward(x).reshape([b, s, h, dk]).swap_dims(1, 2);
+        if dp > dk {
+            Tensor::cat(vec![t, Tensor::zeros([b, h, s, dp - dk], &device)], 3)
+        } else {
+            t
+        }
+    };
+    let q = tetes(requete, &mha.query, sq);
+    let k = tetes(source.clone(), &mha.key, sk);
+    let v = tetes(source, &mha.value, sk);
+    let poids = activation::softmax(
+        q.matmul(k.swap_dims(2, 3)).div_scalar((dk as f32).sqrt()),
+        3,
+    );
+    let mut contexte = poids.matmul(v);
+    if dp > dk {
+        contexte = contexte.narrow(3, 0, dk);
+    }
+    mha.output
+        .forward(contexte.swap_dims(1, 2).reshape([b, sq, d]))
+}
 use crate::{DemucsError, T_HEADS, T_HIDDEN_SCALE, T_LAYERS};
 
 #[derive(Module, Debug)]
@@ -228,8 +272,8 @@ impl<B: Backend> SelfAttentionLayer<B> {
         // Self-attention block
         let residual = x.clone();
         let x_normed = self.norm1.forward(x);
-        let attn_out = self.attn.forward(MhaInput::self_attn(x_normed));
-        let x = self.gamma_1.forward_last(attn_out.context) + residual;
+        let contexte = attention(&self.attn, x_normed.clone(), x_normed);
+        let x = self.gamma_1.forward_last(contexte) + residual;
 
         // FFN block
         let residual = x.clone();
@@ -295,8 +339,8 @@ impl<B: Backend> CrossAttentionLayer<B> {
         let residual = query.clone();
         let q = self.norm1.forward(query);
         let kv = self.norm2.forward(cross);
-        let attn_out = self.attn.forward(MhaInput::new(q, kv.clone(), kv));
-        let x = self.gamma_1.forward_last(attn_out.context) + residual;
+        let contexte = attention(&self.attn, q, kv);
+        let x = self.gamma_1.forward_last(contexte) + residual;
 
         // FFN (same as self-attention)
         let residual = x.clone();
