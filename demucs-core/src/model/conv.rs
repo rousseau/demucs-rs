@@ -14,6 +14,33 @@ use burn::{
 
 use crate::{DCONV_COMP, DCONV_DEPTH, KERNEL_SIZE, STRIDE};
 
+/// Une convolution 1×1 en produit matriciel, canaux d'entrée complétés de
+/// zéros jusqu'au multiple de 32 supérieur.
+///
+/// Mathématiquement identique à `Conv1d::forward` pour un noyau de 1, mais
+/// contourne un noyau faux de cubecl en WGSL : 24 canaux d'entrée sur
+/// ~5 400 échantillons (le `conv2` de la DConv du 2ᵉ encodeur temporel)
+/// s'écartent jusqu'à 70 % du maximum ; à 32 canaux, le noyau est juste.
+/// Reproducteur : `rusty_music/crates/editor/examples/formes_conv.rs`.
+pub(crate) fn conv1x1<B: Backend>(conv: &Conv1d<B>, x: Tensor<B, 3>) -> Tensor<B, 3> {
+    let [lot, entree, long] = x.dims();
+    let w = conv.weight.val(); // [sortie, entree, 1]
+    let sortie = w.dims()[0];
+    let ep = entree.next_multiple_of(32);
+    let device = x.device();
+    let mut w = w.reshape([1, sortie, entree]);
+    let mut x = x;
+    if ep > entree {
+        w = Tensor::cat(vec![w, Tensor::zeros([1, sortie, ep - entree], &device)], 2);
+        x = Tensor::cat(vec![x, Tensor::zeros([lot, ep - entree, long], &device)], 1);
+    }
+    let y = w.expand([lot, sortie, ep]).matmul(x);
+    match &conv.bias {
+        Some(b) => y + b.val().reshape([1, sortie, 1]),
+        None => y,
+    }
+}
+
 #[derive(Module, Debug)]
 pub(crate) struct HEncLayer<B: Backend> {
     pub(crate) conv: Conv2d<B>,    // Conv2d([8,1]) downsamples freq
@@ -98,7 +125,7 @@ impl<B: Backend> TEncLayer<B> {
         let x = self.conv.forward(x);
         let x = activation::gelu(x);
         let x = self.dconv.forward(x);
-        let x = self.rewrite.forward(x);
+        let x = conv1x1(&self.rewrite, x);
         self.glu.forward(x)
     }
 }
@@ -140,7 +167,7 @@ impl<B: Backend> DConvLayer<B> {
         let x = self.conv1.forward(x);
         let x = self.norm1.forward(x);
         let x = activation::gelu(x);
-        let x = self.conv2.forward(x);
+        let x = conv1x1(&self.conv2, x);
         let x = self.norm2.forward(x);
         let x = self.glu.forward(x);
         let x = self.scale.forward(x);
